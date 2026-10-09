@@ -1,0 +1,102 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write   # allows the job to request a GitHub OIDC token (for AWS)
+  contents: read    # allows actions/checkout
+
+jobs:
+  changes:
+    name: Detect changed workloads
+    runs-on: ubuntu-latest
+    outputs:
+      visits: ${{ steps.filter.outputs.visits }}
+      stats: ${{ steps.filter.outputs.stats }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            visits:
+              - 'workloads/visits-service/**'
+            stats:
+              - 'workloads/stats-service/**'
+            frontend:
+              - 'workloads/frontend/**'
+      - name: Summary
+        run: |
+          echo "visits-service changed: ${{ steps.filter.outputs.visits }}"
+          echo "stats-service  changed: ${{ steps.filter.outputs.stats }}"
+          echo "frontend       changed: ${{ steps.filter.outputs.frontend }}"
+
+  deploy-visits:
+    name: Deploy visits-service
+    needs: changes
+    if: needs.changes.outputs.visits == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Load deploy config
+        run: grep -Ev '^\s*(#|$)' deploy/config.env >> "$GITHUB_ENV"
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Build, push to ECR, deploy via SSM
+        run: ./deploy/ci-deploy-service.sh visits
+
+  deploy-stats:
+    name: Deploy stats-service
+    needs: changes
+    if: needs.changes.outputs.stats == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Load deploy config
+        run: grep -Ev '^\s*(#|$)' deploy/config.env >> "$GITHUB_ENV"
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Build, push to ECR, deploy via SSM
+        run: ./deploy/ci-deploy-service.sh stats
+
+  deploy-frontend:
+    name: Deploy frontend
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Load deploy config
+        run: grep -Ev '^\s*(#|$)' deploy/config.env >> "$GITHUB_ENV"
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Inject ALB DNS into index.html
+        run: |
+          mkdir -p build
+          cp -r workloads/frontend/. build/
+          sed -i "s|__API_BASE_URL__|http://${ALB_DNS}|g" build/index.html
+          if grep -q "__API_BASE_URL__" build/index.html; then
+            echo "placeholder was not replaced"; exit 1
+          fi
+          grep -n "API_BASE =" build/index.html
+      - name: Sync to S3
+        run: aws s3 sync build/ "s3://${S3_BUCKET}/" --delete
+      - name: Invalidate CloudFront cache
+        run: |
+          INV_ID=$(aws cloudfront create-invalidation --distribution-id "$CF_DISTRIBUTION_ID" \
+            --paths "/*" --query Invalidation.Id --output text)
+          echo "Invalidation $INV_ID created, waiting..."
+          aws cloudfront wait invalidation-completed --distribution-id "$CF_DISTRIBUTION_ID" --id "$INV_ID"
+          echo "Invalidation completed"
